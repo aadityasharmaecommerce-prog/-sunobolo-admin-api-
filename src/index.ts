@@ -133,7 +133,7 @@ export default {
         const { password_hash: _, ...safeUser } = user;
         return new Response(JSON.stringify({ user: safeUser }), {
           status: 200,
-          headers: { 'content-type': 'application/json', 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true', 'set-cookie': `sb_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${90 * 24 * 60 * 60}` },
+          headers: { 'content-type': 'application/json', 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true', 'set-cookie': `sb_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${90 * 24 * 60 * 60}` },
         });
       }
 
@@ -146,7 +146,7 @@ export default {
         }
         return new Response(JSON.stringify({ ok: true }), {
           status: 200,
-          headers: { 'content-type': 'application/json', 'access-control-allow-origin': allowedOrigin, 'set-cookie': 'sb_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0' },
+          headers: { 'content-type': 'application/json', 'access-control-allow-origin': allowedOrigin, 'set-cookie': 'sb_session=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0' },
         });
       }
 
