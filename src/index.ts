@@ -20,6 +20,7 @@ const json = (data: unknown, init: ResponseInit = {}) =>
       'access-control-allow-origin': init.headers?.['access-control-allow-origin'] || '*',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       'access-control-allow-headers': 'content-type, authorization',
+      'access-control-allow-credentials': 'true',
       ...(init.headers || {}),
     },
   });
@@ -97,7 +98,7 @@ export default {
 
     // Auth check
     const user = await authenticateAdmin(request, env);
-    if (!user) return json({ error: 'Admin authentication required' }, { status: 401, headers: { 'access-control-allow-origin': allowedOrigin } });
+    if (!user) return json({ error: 'Admin authentication required' }, { status: 401, headers: { 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true' } });
 
     const headers = { 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true' };
 
