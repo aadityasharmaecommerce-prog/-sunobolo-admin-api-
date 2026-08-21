@@ -130,7 +130,8 @@ export default {
         const tokenHash = await hashToken(sessionToken, env.SESSION_SECRET || 'default-secret');
         const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
         await env.DB.prepare('INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)').bind(crypto.randomUUID(), user.id, tokenHash, expiresAt).run();
-        return new Response(JSON.stringify({ user }), {
+        const { password_hash: _, ...safeUser } = user;
+        return new Response(JSON.stringify({ user: safeUser }), {
           status: 200,
           headers: { 'content-type': 'application/json', 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true', 'set-cookie': `sb_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${90 * 24 * 60 * 60}` },
         });
