@@ -96,14 +96,10 @@ export default {
       return err('CORS: origin not allowed', 403);
     }
 
-    // Auth check
-    const user = await authenticateAdmin(request, env);
-    if (!user) return json({ error: 'Admin authentication required' }, { status: 401, headers: { 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true' } });
-
     const headers = { 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true' };
 
     try {
-      // ── Auth endpoints (admin-only login) ──
+      // ── Auth endpoints (no auth required) ──
 
       // GET /auth/me
       if (path === '/auth/me' && method === 'GET') {
@@ -153,7 +149,9 @@ export default {
         });
       }
 
-      // ── Admin data endpoints ──
+      // ── Admin data endpoints (auth required) ──
+      const user = await authenticateAdmin(request, env);
+      if (!user) return json({ error: 'Admin authentication required' }, { status: 401, headers });
 
       // GET /dashboard
       if (path === '/dashboard' && method === 'GET') {
