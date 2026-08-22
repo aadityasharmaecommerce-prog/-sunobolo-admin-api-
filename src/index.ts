@@ -156,19 +156,59 @@ export default {
 
       // GET /dashboard
       if (path === '/dashboard' && method === 'GET') {
-        const [totalUsers, activeSubs, expiredSubs, totalPayments, successPayments, failedPayments, totalRevenue, recentPayments] = await Promise.all([
+        const range = url.searchParams.get('range') || 'all';
+        let df = "date('now', '-100 years')";
+        if (range === 'today') df = "date('now', 'start of day')";
+        if (range === '7d') df = "date('now', '-7 days')";
+        if (range === '30d') df = "date('now', '-30 days')";
+        if (range === '3m') df = "date('now', '-3 months')";
+        if (range === '6m') df = "date('now', '-6 months')";
+        if (range === '1y') df = "date('now', '-1 year')";
+
+        const [
+          totalUsers, totalUsersInRange,
+          activeSubs, expiredSubs,
+          totalPayments, successPayments, failedPayments,
+          totalRevenue,
+          payingCustomers,
+          recentPayments, recentActivity,
+        ] = await Promise.all([
           env.DB.prepare('SELECT COUNT(*) as n FROM users').first<{ n: number }>(),
+          env.DB.prepare(`SELECT COUNT(*) as n FROM users WHERE created_at >= ${df}`).first<{ n: number }>(),
           env.DB.prepare("SELECT COUNT(*) as n FROM subscriptions WHERE status = 'active'").first<{ n: number }>(),
           env.DB.prepare("SELECT COUNT(*) as n FROM subscriptions WHERE status = 'expired'").first<{ n: number }>(),
           env.DB.prepare('SELECT COUNT(*) as n FROM payments').first<{ n: number }>(),
-          env.DB.prepare("SELECT COUNT(*) as n FROM payments WHERE status = 'paid'").first<{ n: number }>(),
-          env.DB.prepare("SELECT COUNT(*) as n FROM payments WHERE status = 'failed'").first<{ n: number }>(),
-          env.DB.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'paid'").first<{ total: number }>(),
-          env.DB.prepare(`SELECT p.*, u.name, u.email FROM payments p LEFT JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC LIMIT 20`).all(),
+          env.DB.prepare(`SELECT COUNT(*) as n FROM payments WHERE status = 'paid' AND created_at >= ${df}`).first<{ n: number }>(),
+          env.DB.prepare(`SELECT COUNT(*) as n FROM payments WHERE status = 'failed' AND created_at >= ${df}`).first<{ n: number }>(),
+          env.DB.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'paid' AND created_at >= ${df}`).first<{ total: number }>(),
+          env.DB.prepare(`SELECT COUNT(DISTINCT user_id) as n FROM payments WHERE status = 'paid' AND created_at >= ${df}`).first<{ n: number }>(),
+          env.DB.prepare(`SELECT p.*, u.name, u.email, u.phone FROM payments p LEFT JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC LIMIT 20`).all(),
+          env.DB.prepare('SELECT * FROM audit_events ORDER BY created_at DESC LIMIT 30').all(),
         ]);
+
         const planStats = await env.DB.prepare(`SELECT package_id, COUNT(*) as count FROM subscriptions WHERE status = 'active' GROUP BY package_id`).all();
-        const dailyRevenue = await env.DB.prepare(`SELECT date(created_at) as day, SUM(amount) as revenue, COUNT(*) as count FROM payments WHERE status = 'paid' AND created_at >= date('now', '-30 days') GROUP BY date(created_at) ORDER BY day`).all();
-        return json({ totalUsers: totalUsers?.n || 0, activeSubscriptions: activeSubs?.n || 0, expiredSubscriptions: expiredSubs?.n || 0, totalPayments: totalPayments?.n || 0, successfulPayments: successPayments?.n || 0, failedPayments: failedPayments?.n || 0, totalRevenue: totalRevenue?.total || 0, recentPayments: recentPayments?.results || [], planStats: planStats?.results || [], dailyRevenue: dailyRevenue?.results || [] }, { headers });
+        const dailyRevenue = await env.DB.prepare(`SELECT date(created_at) as day, SUM(amount) as revenue, COUNT(*) as count FROM payments WHERE status = 'paid' AND created_at >= ${df} GROUP BY date(created_at) ORDER BY day`).all();
+        const dailySignups = await env.DB.prepare(`SELECT date(created_at) as day, COUNT(*) as count FROM users WHERE created_at >= ${df} GROUP BY date(created_at) ORDER BY day`).all();
+
+        const freeUsers = (totalUsers?.n || 0) - (payingCustomers?.n || 0);
+
+        return json({
+          totalUsers: totalUsers?.n || 0,
+          newSignups: totalUsersInRange?.n || 0,
+          activeSubscriptions: activeSubs?.n || 0,
+          expiredSubscriptions: expiredSubs?.n || 0,
+          totalPayments: totalPayments?.n || 0,
+          successfulPayments: successPayments?.n || 0,
+          failedPayments: failedPayments?.n || 0,
+          totalRevenue: totalRevenue?.total || 0,
+          payingCustomers: payingCustomers?.n || 0,
+          freeUsers,
+          recentPayments: recentPayments?.results || [],
+          recentActivity: recentActivity?.results || [],
+          planStats: planStats?.results || [],
+          dailyRevenue: dailyRevenue?.results || [],
+          dailySignups: dailySignups?.results || [],
+        }, { headers });
       }
 
       // GET /members
@@ -183,11 +223,11 @@ export default {
         if (search) { where += ' AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`); }
         if (filter === 'active') where += " AND s.status = 'active'";
         if (filter === 'expired') where += " AND s.status = 'expired'";
-        if (filter === 'google') where += " AND u.google_id IS NOT NULL";
         if (filter === '3month') where += " AND s.package_id = 'three_month'";
         if (filter === '6month') where += " AND s.package_id = 'six_month'";
         if (filter === '1year') where += " AND s.package_id = 'one_year'";
-        const q = `SELECT u.id, u.name, u.email, u.created_at, u.is_admin, u.google_id, s.package_id as plan, s.status as sub_status, s.started_at, s.expires_at FROM users u LEFT JOIN subscriptions s ON u.id = s.user_id AND s.id = (SELECT id FROM subscriptions WHERE user_id = u.id ORDER BY expires_at DESC LIMIT 1) WHERE ${where} ORDER BY u.created_at DESC LIMIT ? OFFSET ?`;
+        if (filter === 'free') where += " AND s.id IS NULL";
+        const q = `SELECT u.id, u.name, u.email, u.phone, u.created_at, u.is_admin, u.last_login_at, s.package_id as plan, s.status as sub_status, s.started_at, s.expires_at FROM users u LEFT JOIN subscriptions s ON u.id = s.user_id AND s.id = (SELECT id FROM subscriptions WHERE user_id = u.id ORDER BY expires_at DESC LIMIT 1) WHERE ${where} ORDER BY u.created_at DESC LIMIT ? OFFSET ?`;
         const { results } = await env.DB.prepare(q).bind(...params, limit, offset).all();
         const count = await env.DB.prepare(`SELECT COUNT(*) as n FROM users u LEFT JOIN subscriptions s ON u.id = s.user_id WHERE ${where}`).bind(...params).first<{ n: number }>();
         return json({ members: results || [], total: count?.n || 0, page, limit }, { headers });
