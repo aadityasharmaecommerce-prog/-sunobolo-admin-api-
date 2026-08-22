@@ -180,7 +180,7 @@ export default {
         const offset = (page - 1) * limit;
         let where = '1=1';
         const params: string[] = [];
-        if (search) { where += ' AND (u.name LIKE ? OR u.email LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+        if (search) { where += ' AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`); }
         if (filter === 'active') where += " AND s.status = 'active'";
         if (filter === 'expired') where += " AND s.status = 'expired'";
         if (filter === 'google') where += " AND u.google_id IS NOT NULL";
@@ -197,12 +197,13 @@ export default {
       const memberMatch = path.match(/^\/members\/([\w-]+)$/);
       if (memberMatch && method === 'GET') {
         const uid = memberMatch[1];
-        const mu = await env.DB.prepare('SELECT id, name, email, phone, avatar_color, is_admin, created_at, google_id FROM users WHERE id = ?').bind(uid).first();
+        const mu = await env.DB.prepare('SELECT id, name, email, phone, avatar_color, is_admin, created_at, last_login_at, recovery_email FROM users WHERE id = ?').bind(uid).first();
         if (!mu) return err('Member not found', 404);
         const subs = await env.DB.prepare('SELECT * FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC').bind(uid).all();
         const pay = await env.DB.prepare('SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC').bind(uid).all();
         const prog = await env.DB.prepare('SELECT COUNT(*) as n FROM user_progress WHERE user_id = ?').bind(uid).first<{ n: number }>();
-        return json({ member: mu, subscriptions: subs?.results || [], payments: pay?.results || [], progressCount: prog?.n || 0 }, { headers });
+        const activity = await env.DB.prepare('SELECT * FROM audit_events WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').bind(uid).all();
+        return json({ member: mu, subscriptions: subs?.results || [], payments: pay?.results || [], progressCount: prog?.n || 0, activity: activity?.results || [] }, { headers });
       }
 
       // GET /payments
@@ -214,11 +215,11 @@ export default {
         const offset = (page - 1) * limit;
         let where = '1=1';
         const params: string[] = [];
-        if (search) { where += ' AND (u.name LIKE ? OR u.email LIKE ? OR p.razorpay_payment_id LIKE ? OR p.razorpay_order_id LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); }
+        if (search) { where += ' AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR p.razorpay_payment_id LIKE ? OR p.razorpay_order_id LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); }
         if (status === 'paid') where += " AND p.status = 'paid'";
         if (status === 'failed') where += " AND p.status = 'failed'";
         if (status === 'pending') where += " AND p.status = 'pending'";
-        const q = `SELECT p.*, u.name, u.email FROM payments p LEFT JOIN users u ON p.user_id = u.id WHERE ${where} ORDER BY p.created_at DESC LIMIT ? OFFSET ?`;
+        const q = `SELECT p.*, u.name, u.email, u.phone FROM payments p LEFT JOIN users u ON p.user_id = u.id WHERE ${where} ORDER BY p.created_at DESC LIMIT ? OFFSET ?`;
         const { results } = await env.DB.prepare(q).bind(...params, limit, offset).all();
         const count = await env.DB.prepare(`SELECT COUNT(*) as n FROM payments p LEFT JOIN users u ON p.user_id = u.id WHERE ${where}`).bind(...params).first<{ n: number }>();
         const summary = await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN status='paid' THEN amount ELSE 0 END),0) as revenue, COUNT(CASE WHEN status='paid' THEN 1 END) as success, COUNT(CASE WHEN status='failed' THEN 1 END) as failed, COUNT(CASE WHEN status='pending' THEN 1 END) as pending FROM payments`).first();
