@@ -9,7 +9,30 @@
 interface Env {
   DB: D1Database;
   SESSION_SECRET?: string;
+  PASSWORD_PEPPER?: string;
   ADMIN_ORIGIN?: string;
+  VAPID_PUBLIC_KEY?: string;
+  WEB_PUSH_PRIVATE_KEY?: string;
+  WEB_PUSH_SUBJECT?: string;
+}
+
+/** Build CORS+security headers for admin API responses */
+function getAdminHeaders(origin: string, env: Env): Record<string, string> {
+  const allowedOrigin = env.ADMIN_ORIGIN || 'https://admin.sunobolo.in';
+  const isAllowed = origin && origin.includes(new URL(allowedOrigin).hostname);
+  return {
+    'access-control-allow-origin': isAllowed ? origin : allowedOrigin,
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization',
+    'access-control-allow-credentials': 'true',
+    'strict-transport-security': 'max-age=63072000; includeSubDomains; preload',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'strict-origin-when-cross-origin',
+    'permissions-policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=()',
+    // CSP for API responses (JSON only — no scripts/styles needed)
+    'content-security-policy': "default-src 'none'; frame-ancestors 'none';",
+  };
 }
 
 const json = (data: unknown, init: ResponseInit = {}) =>
@@ -17,17 +40,25 @@ const json = (data: unknown, init: ResponseInit = {}) =>
     ...init,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      'access-control-allow-origin': init.headers?.['access-control-allow-origin'] || '*',
-      'access-control-allow-methods': 'GET, POST, OPTIONS',
-      'access-control-allow-headers': 'content-type, authorization',
-      'access-control-allow-credentials': 'true',
       ...(init.headers || {}),
     },
   });
 
 const err = (msg: string, status = 400) => json({ error: msg }, { status });
 
-const PASSWORD_PEPPER = 'sunobolo-secret-key-2024';
+/**
+ * Require PASSWORD_PEPPER from env. Fail safely if not configured.
+ * SECURITY: Never use hardcoded fallback secrets.
+ * Migration: Set PASSWORD_PEPPER to the same value as the old hardcoded pepper
+ * via `wrangler secret put` BEFORE deploying this code.
+ */
+function getPasswordPepper(env: Env): string {
+  if (!env.PASSWORD_PEPPER) {
+    console.error('[SECURITY] PASSWORD_PEPPER not configured — authentication will fail. Set via wrangler secret put.');
+    throw new Error('Server configuration error. Please contact support.');
+  }
+  return env.PASSWORD_PEPPER;
+}
 
 async function hashToken(token: string, secret: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -36,11 +67,20 @@ async function hashToken(token: string, secret: string): Promise<string> {
   return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function hashPassword(password: string): Promise<string> {
+async function hashPassword(password: string, pepper: string): Promise<string> {
   const encoder = new TextEncoder();
-  const data = encoder.encode(password + PASSWORD_PEPPER);
+  const data = encoder.encode(password + pepper);
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Check admin login rate limit: max 10 failed attempts per email per 15 minutes */
+async function checkAdminLoginRateLimit(email: string, db: D1Database): Promise<boolean> {
+  const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const result = await db.prepare(
+    `SELECT COUNT(*) as cnt FROM login_attempts WHERE phone = ? AND attempted_at > ? AND success = 0`
+  ).bind(email, fifteenMinAgo).first<{ cnt: number }>();
+  return (result?.cnt || 0) >= 10;
 }
 
 function extractSessionToken(cookieHeader: string | null): string | null {
@@ -78,15 +118,8 @@ export default {
 
     // CORS preflight
     if (method === 'OPTIONS') {
-      const allowed = env.ADMIN_ORIGIN || 'https://admin.sunobolo.in';
       return new Response(null, {
-        headers: {
-          'access-control-allow-origin': allowed,
-          'access-control-allow-methods': 'GET, POST, OPTIONS',
-          'access-control-allow-headers': 'content-type, authorization',
-          'access-control-allow-credentials': 'true',
-          'max-age': '86400',
-        },
+        headers: { ...getAdminHeaders(origin, env), 'max-age': '86400' },
       });
     }
 
@@ -96,7 +129,7 @@ export default {
       return err('CORS: origin not allowed', 403);
     }
 
-    const headers = { 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true' };
+    const headers = getAdminHeaders(origin, env);
 
     try {
       // ── Auth endpoints (no auth required) ──
@@ -118,22 +151,31 @@ export default {
         const body = await request.json<{ email?: string; password?: string }>();
         if (!body?.email || !body?.password) return err('Email and password required');
 
+        // Rate limit: max 10 failed admin login attempts per email per 15 minutes
+        if (await checkAdminLoginRateLimit(body.email, env.DB)) {
+          return err('Too many failed attempts. Please try again after 15 minutes.', 429);
+        }
+
         const user = await env.DB.prepare('SELECT id, name, email, is_admin, password_hash FROM users WHERE email = ?').bind(body.email).first<{ id: string; name: string; email: string; is_admin: number; password_hash: string | null }>();
         if (!user || !user.is_admin) return err('Invalid credentials or not an admin account', 401);
 
         // Verify password
         if (!user.password_hash) return err('Admin password not set. Contact developer.', 403);
-        const inputHash = await hashPassword(body.password);
+        const inputHash = await hashPassword(body.password, getPasswordPepper(env));
         if (inputHash !== user.password_hash) return err('Invalid password', 401);
 
         const sessionToken = crypto.randomUUID();
-        const tokenHash = await hashToken(sessionToken, env.SESSION_SECRET || 'default-secret');
+        if (!env.SESSION_SECRET) {
+          console.error('[ADMIN] SESSION_SECRET not configured');
+          return err('Server configuration error', 500);
+        }
+        const tokenHash = await hashToken(sessionToken, env.SESSION_SECRET);
         const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
         await env.DB.prepare('INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)').bind(crypto.randomUUID(), user.id, tokenHash, expiresAt).run();
         const { password_hash: _, ...safeUser } = user;
         return new Response(JSON.stringify({ user: safeUser }), {
           status: 200,
-          headers: { 'content-type': 'application/json', 'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true', 'set-cookie': `sb_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${90 * 24 * 60 * 60}` },
+          headers: { 'content-type': 'application/json', ...headers, 'set-cookie': `sb_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${90 * 24 * 60 * 60}` },
         });
       }
 
@@ -281,6 +323,285 @@ export default {
           env.DB.prepare(`SELECT status, COUNT(*) as count FROM subscriptions GROUP BY status`).all(),
         ]);
         return json({ revenueByDay: rev?.results || [], subsByPlan: plan?.results || [], newUsers: users?.results || [], topCourses: courses?.results || [], activevsExpired: ae?.results || [] }, { headers });
+      }
+
+      // ── Push Notification routes ──
+
+      // GET /push/stats
+      if (path === '/push/stats' && method === 'GET') {
+        const [totalSubs, totalUsers, totalNotifs, totalSent] = await Promise.all([
+          env.DB.prepare('SELECT COUNT(*) as n FROM push_subscriptions').first<{ n: number }>(),
+          env.DB.prepare('SELECT COUNT(*) as n FROM users').first<{ n: number }>(),
+          env.DB.prepare('SELECT COUNT(*) as n FROM notifications').first<{ n: number }>(),
+          env.DB.prepare("SELECT COALESCE(SUM(total_sent), 0) as n FROM notifications WHERE status = 'sent'").first<{ n: number }>(),
+        ]);
+        return json({
+          subscriptions: totalSubs?.n || 0,
+          totalUsers: totalUsers?.n || 0,
+          notificationsSent: totalNotifs?.n || 0,
+          totalPushesSent: totalSent?.n || 0,
+        }, { headers });
+      }
+
+      // GET /notifications
+      if (path === '/notifications' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50'
+        ).all();
+        return json({ notifications: results || [] }, { headers });
+      }
+
+      // GET /notifications/:id/stats
+      const notifStatsMatch = path.match(/^\/notifications\/([\w-]+)\/stats$/);
+      if (notifStatsMatch && method === 'GET') {
+        const nid = notifStatsMatch[1];
+        const notif = await env.DB.prepare('SELECT * FROM notifications WHERE id = ?').bind(nid).first();
+        if (!notif) return err('Notification not found', 404);
+        const clicks = await env.DB.prepare('SELECT COUNT(*) as n FROM push_events WHERE notification_id = ? AND event_type = \"click\"').bind(nid).first<{ n: number }>();
+        const closes = await env.DB.prepare('SELECT COUNT(*) as n FROM push_events WHERE notification_id = ? AND event_type = \"close\"').bind(nid).first<{ n: number }>();
+        return json({ notification: notif, clicks: clicks?.n || 0, closes: closes?.n || 0 }, { headers });
+      }
+
+      // POST /notifications/send
+      if (path === '/notifications/send' && method === 'POST') {
+        const body = await request.json<{ title?: string; message?: string; cta_text?: string; cta_url?: string; type?: string; audience?: string }>();
+        if (!body?.title || !body?.message) return err('Title and message required');
+
+        // Anti-spam: Max 3 marketing per 24h
+        const notifType = body.type || 'marketing';
+        if (notifType === 'marketing') {
+          const last24h = await env.DB.prepare(
+            "SELECT COUNT(*) as cnt FROM notifications WHERE type = 'marketing' AND status = 'sent' AND sent_at > datetime('now', '-1 day')"
+          ).first<{ cnt: number }>();
+          if ((last24h?.cnt || 0) >= 3) {
+            return err('Anti-spam limit: Maximum 3 marketing notifications per 24 hours.', 429);
+          }
+          const last7d = await env.DB.prepare(
+            "SELECT COUNT(*) as cnt FROM notifications WHERE type = 'marketing' AND status = 'sent' AND sent_at > datetime('now', '-7 days')"
+          ).first<{ cnt: number }>();
+          if ((last7d?.cnt || 0) >= 10) {
+            return err('Anti-spam limit: Maximum 10 marketing notifications per week.', 429);
+          }
+          const dup = await env.DB.prepare(
+            "SELECT id FROM notifications WHERE title = ? AND message = ? AND status = 'sent' AND sent_at > datetime('now', '-1 hour')"
+          ).bind(body.title, body.message).first();
+          if (dup) return err('Duplicate notification sent in the last hour.', 409);
+        }
+
+        const notificationId = 'n_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const audience = body.audience || 'all';
+
+        // Build audience query
+        let audienceQuery = 'SELECT DISTINCT ps.* FROM push_subscriptions ps JOIN users u ON ps.user_id = u.id';
+        const conditions: string[] = [];
+        if (audience === 'free') conditions.push("u.id NOT IN (SELECT user_id FROM subscriptions WHERE status = 'active')");
+        else if (audience === 'paid') conditions.push("u.id IN (SELECT user_id FROM subscriptions WHERE status = 'active')");
+        else if (audience === 'inactive_7d') conditions.push("u.last_login_at < datetime('now', '-7 days')");
+        else if (audience === 'inactive_30d') conditions.push("u.last_login_at < datetime('now', '-30 days')");
+        if (conditions.length > 0) audienceQuery += ' WHERE ' + conditions.join(' AND ');
+
+        const { results: subscriptions } = await env.DB.prepare(audienceQuery).all();
+
+        // Store notification
+        await env.DB.prepare(
+          'INSERT INTO notifications (id, title, message, cta_text, cta_url, type, audience, status, total_sent, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"))'
+        ).bind(notificationId, body.title, body.message, body.cta_text || 'Open', body.cta_url || '/', notifType, audience, 'sent', subscriptions?.length || 0).run();
+
+        // Send web push
+        let sent = 0;
+        let failed = 0;
+        const webPushSecret = env.WEB_PUSH_PRIVATE_KEY || '';
+        const webPushSubject = env.WEB_PUSH_SUBJECT || 'https://sunobolo.in';
+
+        if (webPushSecret) {
+          for (const sub of (subscriptions || []) as any[]) {
+            try {
+              const pushPayload = JSON.stringify({
+                title: body.title,
+                body: body.message,
+                icon: '/images/logo.png',
+                badge: '/images/logo.png',
+                data: { url: body.cta_url || '/', notification_id: notificationId },
+                actions: body.cta_text ? [{ action: 'open', title: body.cta_text }] : [],
+              });
+
+              const response = await fetch(sub.endpoint, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/octet-stream',
+                  'TTL': '86400',
+                  'Urgency': 'normal',
+                  'Authorization': webPushSecret,
+                },
+                body: pushPayload,
+              });
+
+              if (response.ok || response.status === 201) {
+                sent++;
+                await env.DB.prepare(
+                  'INSERT INTO notification_log (id, notification_id, user_id, endpoint, status, sent_at) VALUES (?, ?, ?, ?, ?, datetime("now"))'
+                ).bind('nl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), notificationId, sub.user_id, sub.endpoint, 'sent').run();
+              } else {
+                failed++;
+                if (response.status === 404 || response.status === 410) {
+                  await env.DB.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').bind(sub.endpoint).run();
+                }
+              }
+            } catch {
+              failed++;
+            }
+          }
+        } else {
+          failed = subscriptions?.length || 0;
+        }
+
+        return json({ ok: true, notificationId, total: subscriptions?.length || 0, sent, failed }, { headers });
+      }
+
+      // ── Coupon Management routes ──
+
+      // GET /coupons — list all coupons
+      if (path === '/coupons' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM coupons ORDER BY created_at DESC'
+        ).all();
+        return json({ coupons: results || [] }, { headers });
+      }
+
+      // POST /coupons — create a new coupon
+      if (path === '/coupons' && method === 'POST') {
+        const body = await request.json<{
+          code?: string; discount_type?: string; discount_value?: number;
+          applicable_plans?: string; start_date?: string; expiry_date?: string;
+          max_total_uses?: number; max_uses_per_user?: number;
+          min_order_amount?: number; description?: string;
+        }>();
+
+        if (!body?.code || !body?.discount_type || body.discount_value === undefined || !body?.start_date || !body?.expiry_date) {
+          return err('Missing required fields: code, discount_type, discount_value, start_date, expiry_date');
+        }
+
+        // Normalize code
+        const code = body.code.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (code.length < 3 || code.length > 20) return err('Code must be 3-20 alphanumeric characters');
+        if (!['percentage', 'fixed'].includes(body.discount_type)) return err('discount_type must be percentage or fixed');
+        if (body.discount_type === 'percentage' && (body.discount_value < 1 || body.discount_value > 100)) {
+          return err('Percentage must be between 1 and 100');
+        }
+        if (body.discount_type === 'fixed' && body.discount_value < 1) {
+          return err('Fixed discount must be at least ₹1');
+        }
+
+        // Check duplicate code
+        const existing = await env.DB.prepare('SELECT id FROM coupons WHERE code = ?').bind(code).first();
+        if (existing) return err('A coupon with this code already exists', 409);
+
+        const id = 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        await env.DB.prepare(
+          `INSERT INTO coupons (id, code, discount_type, discount_value, applicable_plans, start_date, expiry_date, max_total_uses, max_uses_per_user, min_order_amount, is_active, description)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+        ).bind(
+          id, code, body.discount_type, body.discount_value,
+          body.applicable_plans || 'all', body.start_date, body.expiry_date,
+          body.max_total_uses || 0, body.max_uses_per_user || 1,
+          body.min_order_amount || 0, body.description || null
+        ).run();
+
+        const coupon = await env.DB.prepare('SELECT * FROM coupons WHERE id = ?').bind(id).first();
+        return json({ ok: true, coupon }, { headers, status: 201 });
+      }
+
+      // PUT /coupons/:id — update a coupon
+      const couponUpdateMatch = path.match(/^\/coupons\/([\w-]+)$/);
+      if (couponUpdateMatch && method === 'PUT') {
+        const cid = couponUpdateMatch[1];
+        const existingCoupon = await env.DB.prepare('SELECT * FROM coupons WHERE id = ?').bind(cid).first();
+        if (!existingCoupon) return err('Coupon not found', 404);
+
+        const body = await request.json<Record<string, unknown>>();
+        const updates: string[] = [];
+        const vals: unknown[] = [];
+
+        if (body.code !== undefined) {
+          const newCode = String(body.code).toUpperCase().replace(/[^A-Z0-9]/g, '');
+          if (newCode.length < 3 || newCode.length > 20) return err('Code must be 3-20 alphanumeric characters');
+          if (newCode !== existingCoupon.code) {
+            const dup = await env.DB.prepare('SELECT id FROM coupons WHERE code = ? AND id != ?').bind(newCode, cid).first();
+            if (dup) return err('A coupon with this code already exists', 409);
+          }
+          updates.push('code = ?'); vals.push(newCode);
+        }
+        if (body.discount_type !== undefined) { updates.push('discount_type = ?'); vals.push(body.discount_type); }
+        if (body.discount_value !== undefined) { updates.push('discount_value = ?'); vals.push(body.discount_value); }
+        if (body.applicable_plans !== undefined) { updates.push('applicable_plans = ?'); vals.push(body.applicable_plans); }
+        if (body.start_date !== undefined) { updates.push('start_date = ?'); vals.push(body.start_date); }
+        if (body.expiry_date !== undefined) { updates.push('expiry_date = ?'); vals.push(body.expiry_date); }
+        if (body.max_total_uses !== undefined) { updates.push('max_total_uses = ?'); vals.push(body.max_total_uses); }
+        if (body.max_uses_per_user !== undefined) { updates.push('max_uses_per_user = ?'); vals.push(body.max_uses_per_user); }
+        if (body.min_order_amount !== undefined) { updates.push('min_order_amount = ?'); vals.push(body.min_order_amount); }
+        if (body.is_active !== undefined) { updates.push('is_active = ?'); vals.push(body.is_active ? 1 : 0); }
+        if (body.description !== undefined) { updates.push('description = ?'); vals.push(body.description); }
+
+        if (updates.length === 0) return err('No fields to update');
+        updates.push('updated_at = datetime("now")');
+        vals.push(cid);
+
+        await env.DB.prepare(`UPDATE coupons SET ${updates.join(', ')} WHERE id = ?`).bind(...vals).run();
+        const updated = await env.DB.prepare('SELECT * FROM coupons WHERE id = ?').bind(cid).first();
+        return json({ ok: true, coupon: updated }, { headers });
+      }
+
+      // DELETE /coupons/:id — soft delete (set inactive)
+      const couponDeleteMatch = path.match(/^\/coupons\/([\w-]+)$/);
+      if (couponDeleteMatch && method === 'DELETE') {
+        const cid = couponDeleteMatch[1];
+        const existingCoupon = await env.DB.prepare('SELECT id FROM coupons WHERE id = ?').bind(cid).first();
+        if (!existingCoupon) return err('Coupon not found', 404);
+        await env.DB.prepare('UPDATE coupons SET is_active = 0, updated_at = datetime("now") WHERE id = ?').bind(cid).run();
+        return json({ ok: true }, { headers });
+      }
+
+      // GET /coupons/:id/stats — usage statistics
+      const couponStatsMatch = path.match(/^\/coupons\/([\w-]+)\/stats$/);
+      if (couponStatsMatch && method === 'GET') {
+        const cid = couponStatsMatch[1];
+        const coupon = await env.DB.prepare('SELECT * FROM coupons WHERE id = ?').bind(cid).first();
+        if (!coupon) return err('Coupon not found', 404);
+
+        const totalUsed = await env.DB.prepare(
+          'SELECT COUNT(*) as n FROM coupon_usages WHERE coupon_id = ? AND status = ?'
+        ).bind(cid, 'completed').first<{ n: number }>();
+
+        const totalRevenue = await env.DB.prepare(
+          'SELECT COALESCE(SUM(final_amount), 0) as total FROM coupon_usages WHERE coupon_id = ? AND status = ?'
+        ).bind(cid, 'completed').first<{ total: number }>();
+
+        const totalDiscountGiven = await env.DB.prepare(
+          'SELECT COALESCE(SUM(discount_amount), 0) as total FROM coupon_usages WHERE coupon_id = ? AND status = ?'
+        ).bind(cid, 'completed').first<{ total: number }>();
+
+        const uniqueUsers = await env.DB.prepare(
+          'SELECT COUNT(DISTINCT user_id) as n FROM coupon_usages WHERE coupon_id = ? AND status = ?'
+        ).bind(cid, 'completed').first<{ n: number }>();
+
+        const recentUsages = await env.DB.prepare(
+          `SELECT cu.*, u.name, u.email FROM coupon_usages cu
+           LEFT JOIN users u ON cu.user_id = u.id
+           WHERE cu.coupon_id = ? AND cu.status = 'completed'
+           ORDER BY cu.created_at DESC LIMIT 20`
+        ).bind(cid).all();
+
+        return json({
+          coupon,
+          usage: {
+            totalUsed: totalUsed?.n || 0,
+            remainingUses: (coupon as any).max_total_uses > 0 ? Math.max(0, (coupon as any).max_total_uses - (totalUsed?.n || 0)) : -1,
+            totalRevenue: totalRevenue?.total || 0,
+            totalDiscount: totalDiscountGiven?.total || 0,
+            uniqueUsers: uniqueUsers?.n || 0,
+          },
+          recentUsages: recentUsages?.results || [],
+        }, { headers });
       }
 
       return err('Not found', 404);
